@@ -402,11 +402,56 @@ function Get-ServiceExePath($Service) {
     return ($pathName -split ' ')[0]
 }
 
-function Stop-ComponentService([string] $Name, [string] $ExePath) {
+# Seconds a component may spend finishing running work before it stops. Only the Session Worker
+# drains (running sessions and hook tasks); its host allows 30s on top for the rest of shutdown.
+function Get-StopDrainSeconds($Item) {
+    if ($Item.Key -ne 'SessionWorker') { return 0 }
+    $value = Get-JsonValue (Read-AppSettings $Item.InstallDir) 'ShutdownDrainTimeoutSeconds'
+    if ($null -eq $value) { return 600 }
+    return [math]::Max(0, [int] $value)
+}
+
+function Test-StopKeyPressed {
+    try {
+        while ([Console]::KeyAvailable) {
+            if ([Console]::ReadKey($true).Key -eq [ConsoleKey]::S) { return $true }
+        }
+    }
+    catch { }  # no interactive console (redirected input)
+    return $false
+}
+
+# The stop is requested without blocking so the wait can be reported, and skipped with S while a
+# Session Worker drains. A service still running after its drain time plus a grace period has its
+# process ended, so an upgrade never waits forever.
+function Stop-ComponentService([string] $Name, [string] $ExePath, [int] $DrainSeconds = 0) {
     $service = Get-Service -Name $Name
     if ($service.Status -ne 'Stopped') {
         Write-Note "Stopping service '$Name'..."
-        Stop-Service -Name $Name -Force
+        if ($service.Status -ne 'StopPending') { $service.Stop() }
+        $budget = $DrainSeconds + 120
+        if ($DrainSeconds -gt 0) {
+            Write-Note "Running sessions get up to $([math]::Ceiling($DrainSeconds / 60)) min to finish (ShutdownDrainTimeoutSeconds). Press S to stop now and abandon them."
+        }
+        $started = Get-Date
+        $nextReport = 30
+        while ($true) {
+            $service.Refresh()
+            if ($service.Status -eq 'Stopped') { break }
+            $elapsed = [int] ((Get-Date) - $started).TotalSeconds
+            $skipped = $DrainSeconds -gt 0 -and (Test-StopKeyPressed)
+            if ($skipped -or $elapsed -ge $budget) {
+                $reason = if ($skipped) { 'Stop requested' } else { "Service '$Name' did not stop within $elapsed s" }
+                Write-Warning "$reason; ending its process. Work it was still running is abandoned."
+                Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $ExePath } | Stop-Process -Force
+                break
+            }
+            if ($elapsed -ge $nextReport) {
+                Write-Note "Still stopping ($elapsed s of up to $budget s)..."
+                $nextReport += 30
+            }
+            Start-Sleep -Milliseconds 500
+        }
     }
     # The process can outlive the SCM "stopped" state briefly and keep its files locked.
     $deadline = (Get-Date).AddSeconds(60)
@@ -492,8 +537,7 @@ function Remove-EmptyDirectory([string] $Path) {
 
 function Uninstall-Component($Item) {
     $definition = $Item.Definition
-    if ($Item.Key -eq 'SessionWorker') { Write-Note 'The Session Worker waits for running sessions to finish before stopping (up to ShutdownDrainTimeoutSeconds).' }
-    Stop-ComponentService $definition.ServiceName (Join-Path $Item.InstallDir $definition.Exe)
+    Stop-ComponentService $definition.ServiceName (Join-Path $Item.InstallDir $definition.Exe) (Get-StopDrainSeconds $Item)
     & sc.exe delete $definition.ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not delete service '$($definition.ServiceName)' (sc.exe exit code $LASTEXITCODE)." }
     Write-Note "Removed service '$($definition.ServiceName)'."
@@ -537,11 +581,17 @@ function Sync-PackageFiles([string] $Staging, [string] $Target, [switch] $KeepAp
             $stalePath = Join-Path $Target $stale
             if (Test-Path $stalePath) { Remove-Item -Path $stalePath -Force }
         }
-        Get-ChildItem -Path $Target -Recurse -Directory |
-            Where-Object { ($_.FullName.Substring($Target.TrimEnd('\').Length + 1) -split '\\')[0] -notin $preservedDirs } |
-            Sort-Object { $_.FullName.Length } -Descending |
-            Where-Object { -not (Get-ChildItem -Path $_.FullName -Force) } |
-            Remove-Item -Force
+        # Only folders that held package files are emptied out. Data kept under the install folder
+        # (a Deployment Worker's slots, a StoragePath placed there) is never walked: it is not the
+        # package's, and its working copies can exceed MAX_PATH.
+        $packageDirs = @($oldFiles | Where-Object { $_ } | ForEach-Object {
+            $dir = Split-Path -Parent $_
+            while ($dir) { $dir; $dir = Split-Path -Parent $dir }
+        } | Select-Object -Unique)
+        foreach ($dir in $packageDirs | Sort-Object Length -Descending) {
+            $path = Join-Path $Target $dir
+            if ((Test-Path -LiteralPath $path) -and -not (Get-ChildItem -LiteralPath $path -Force)) { Remove-Item -LiteralPath $path -Force }
+        }
     }
     else {
         # Installed without this script: only the harness plugin folder, which older packages shipped
@@ -1171,8 +1221,7 @@ try {
 
         if ($isUpgrade) {
             if ($previous) { Write-Note "Installed version: $previous" }
-            if ($item.Key -eq 'SessionWorker') { Write-Note 'The Session Worker waits for running sessions to finish before stopping (up to ShutdownDrainTimeoutSeconds).' }
-            Stop-ComponentService $definition.ServiceName $exePath
+            Stop-ComponentService $definition.ServiceName $exePath (Get-StopDrainSeconds $item)
             Assert-HarnessRollbackReady $item $previous $releaseVersion
         }
         else {
