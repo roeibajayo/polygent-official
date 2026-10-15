@@ -84,14 +84,6 @@ param(
     # Default: the computer name.
     [string] $WorkerName,
 
-    # Server / Session Worker: Claude Code configuration folder whose login runs Claude Code models
-    # (Harness:ClaudeConfigDirectory). Default: offered when your own login is detected.
-    [string] $ClaudeConfigDirectory,
-
-    # Server / Session Worker: Codex folder whose ChatGPT subscription login runs OpenAI models
-    # (service CODEX_HOME). Default: offered when your own login is detected.
-    [string] $CodexHome,
-
     # Register and configure the services without starting them.
     [switch] $NoStart,
 
@@ -205,12 +197,11 @@ function Read-Choice([string] $Prompt, [string[]] $Options) {
     }
 }
 
-function Read-Secret([string] $Prompt, [switch] $Optional) {
+function Read-Secret([string] $Prompt) {
     $script:Prompted = $true
     while ($true) {
         $value = Read-Host $Prompt -AsSecureString
         if ($value.Length -gt 0) { return $value }
-        if ($Optional) { return $null }
         Write-Host '    A value is required.' -ForegroundColor Yellow
     }
 }
@@ -383,6 +374,45 @@ function Stop-ComponentService([string] $Name, [string] $ExePath) {
     }
 }
 
+function Assert-HarnessRollbackReady($Item, [string] $InstalledVersion, [string] $TargetVersion) {
+    if ($Item.Key -notin @('Server', 'SessionWorker')) { return }
+    $installed = ($InstalledVersion -split '\+')[0].TrimStart('v')
+    $target = $TargetVersion.TrimStart('v')
+    if (-not $installed) { throw 'Cannot establish the installed harness version; refusing to replace its binaries.' }
+    if ([version](($target -split '-')[0]) -gt [version](($installed -split '-')[0]) -or $target -eq $installed) { return }
+    if (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Join-Path $Item.InstallDir $Item.Definition.Exe) }) {
+        throw 'The harness host is still running. Stop it before preparing or installing a rollback.'
+    }
+
+    $settings = Read-AppSettings $Item.InstallDir
+    $harnessRoot = Get-JsonValue $settings 'Harness:DataDirectory'
+    $machineHarnessRoot = [Environment]::GetEnvironmentVariable('Harness__DataDirectory', 'Machine')
+    if ($machineHarnessRoot) { $harnessRoot = $machineHarnessRoot }
+    $environmentRoot = [Environment]::GetEnvironmentVariable('POLYGENT_HARNESS_DATA_DIR', 'Machine')
+    $serviceSettings = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($Item.Definition.ServiceName)" -ErrorAction SilentlyContinue
+    foreach ($entry in $serviceSettings.Environment) {
+        if ($entry -like 'Harness__DataDirectory=*') { $harnessRoot = $entry.Substring('Harness__DataDirectory='.Length) }
+        if ($entry -like 'POLYGENT_HARNESS_DATA_DIR=*') { $environmentRoot = $entry.Substring('POLYGENT_HARNESS_DATA_DIR='.Length) }
+    }
+    if ($environmentRoot) { $harnessRoot = $environmentRoot }
+    if (-not $harnessRoot) {
+        $service = Get-InstalledService $Item.Definition.ServiceName
+        if ($service.StartName -ne 'LocalSystem') {
+            throw 'Rollback requires an explicit Harness:DataDirectory for a service using a custom account. Verify its actual harness directory before retrying.'
+        }
+        $harnessRoot = Join-Path $env:SystemRoot 'System32\config\systemprofile\.polygent\harness'
+    }
+    if (-not [IO.Path]::IsPathRooted($harnessRoot)) { throw 'Rollback requires an absolute harness data directory.' }
+    $sessionsRoot = Join-Path $harnessRoot 'sessions'
+    if (-not (Test-Path -LiteralPath $sessionsRoot)) { return }
+    foreach ($session in Get-ChildItem -LiteralPath $sessionsRoot -Directory -Force) {
+        $journal = Join-Path $session.FullName 'journal'
+        if ((Test-Path -LiteralPath $journal) -and (Get-ChildItem -LiteralPath $journal -File -Force -Filter '*.jsonl')) {
+            throw "Rollback blocked: harness journals remain in '$harnessRoot'. With the host stopped, use a build containing --prepare-harness-rollback to convert this directory into checkpoints with a new backup outside it, then retry. See docs/modules/polygent-code-harness.md. The installed binaries have not been replaced."
+        }
+    }
+}
+
 function Get-ComponentState([string] $Key) {
     $service = Get-InstalledService $definitions[$Key].ServiceName
     if (-not $service) { return [pscustomobject]@{ Installed = $false; Service = $null; Status = 'Not installed'; Version = $null; InstallDir = $null } }
@@ -454,8 +484,7 @@ function Test-Preserved([string] $RelativePath) {
 }
 
 # Replaces the previous package's files with the new package's. Files listed in the previous
-# manifest but absent from the new package are removed; this matters for plugins\harness\<version>,
-# where the highest version folder present wins, so a leftover newer folder would break a rollback.
+# manifest but absent from the new package are removed.
 # -KeepAppSettings leaves the installed appsettings.json in place (settings that could not be migrated).
 function Sync-PackageFiles([string] $Staging, [string] $Target, [switch] $KeepAppSettings) {
     $newFiles = Get-RelativeFiles $Staging | Where-Object { -not (Test-Preserved $_) }
@@ -474,12 +503,10 @@ function Sync-PackageFiles([string] $Staging, [string] $Target, [switch] $KeepAp
             Remove-Item -Force
     }
     else {
-        # Installed without this script: only the plugin version folders are known to be package-owned.
-        $pluginRoot = Join-Path $Target 'plugins\harness'
-        if (Test-Path $pluginRoot) {
-            $newVersions = @(Get-ChildItem -Path (Join-Path $Staging 'plugins\harness') -Directory -ErrorAction SilentlyContinue | ForEach-Object Name)
-            Get-ChildItem -Path $pluginRoot -Directory | Where-Object { $_.Name -notin $newVersions } | Remove-Item -Recurse -Force
-        }
+        # Installed without this script: only the harness plugin folder, which older packages shipped
+        # and current packages no longer do, is known to be package-owned.
+        $pluginRoot = Join-Path $Target 'plugins'
+        if (Test-Path $pluginRoot) { Remove-Item -Path $pluginRoot -Recurse -Force }
     }
 
     # Excluded by full source path, so only the root-level file is skipped.
@@ -766,9 +793,10 @@ function ConvertFrom-JwtPayload([string] $Token) {
 }
 
 # The services run as LocalSystem, whose own profile has no command-line tool logins. The login of
-# the admin running this script can be shared instead: Harness:ClaudeConfigDirectory for Claude Code
-# (Polygent then also launches that account's own Claude CLI install), CODEX_HOME for the
-# ChatGPT/Codex subscription used by OpenAI models.
+# the admin running this script can be shared instead, per host, in the UI's Agent Logins section:
+# the Claude Code login folder (Polygent then also launches that account's own Claude CLI install)
+# and the Codex login folder for the ChatGPT/Codex subscription used by OpenAI models. The script
+# detects them and prints the folders to paste there in Next steps.
 function Find-ClaudeLogin {
     $directory = Join-Path $env:USERPROFILE '.claude'
     $credentials = Join-Path $directory '.credentials.json'
@@ -796,17 +824,6 @@ function Find-CodexLogin {
         if ($claims -and $claims.'https://api.openai.com/auth'.chatgpt_plan_type) { $plan = $claims.'https://api.openai.com/auth'.chatgpt_plan_type; break }
     }
     return [pscustomobject]@{ Directory = $directory; Plan = $plan }
-}
-
-function Get-ServiceEnvironment([string] $ServiceName) {
-    $value = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName" -Name Environment -ErrorAction SilentlyContinue
-    if ($value) { return @($value.Environment) }
-    return @()
-}
-
-function Set-ServiceEnvironmentVariable([string] $ServiceName, [string] $Name, [string] $Value) {
-    $entries = @(Get-ServiceEnvironment $ServiceName | Where-Object { $_ -notlike "$Name=*" }) + "$Name=$Value"
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName" -Name Environment -Value ([string[]] $entries) -Type MultiString
 }
 
 function Get-StoragePath($Key, $Settings) {
@@ -975,52 +992,20 @@ if (-not $WorkerName -and $newWorkers.Count -gt 0) {
     $WorkerName = Read-Value 'Worker name shown on the Hosts page (unique per worker)' $env:COMPUTERNAME -Required
 }
 
-# New workers need a key; upgrades keep the current one unless a replacement is entered.
+# New workers need a key; upgrades keep the current one unless a replacement is passed as a parameter.
 foreach ($key in 'SessionWorker', 'DeployWorker') {
     $item = $active | Where-Object Key -eq $key
     $variable = "${key}ApiKey"
-    if (-not $item -or (Get-Variable -Name $variable -ValueOnly)) { continue }
+    if (-not $item -or $item.Action -eq 'Upgrade' -or (Get-Variable -Name $variable -ValueOnly)) { continue }
     $prompt = "$($item.Definition.Label) host API key (Hosts -> API Keys -> New API Key -> $(if ($key -eq 'DeployWorker') { 'Deploy Worker' } else { 'Session Worker' }))"
-    $value = if ($item.Action -eq 'Upgrade') { Read-Secret "$prompt, or Enter to keep the current key" -Optional } else { Read-Secret $prompt }
-    Set-Variable -Name $variable -Value $value
+    Set-Variable -Name $variable -Value (Read-Secret $prompt)
 }
 
-# Command-line model logins, offered only for hosts that run sessions and do not have one set yet.
+# Command-line model logins are set per host in the UI; detect the admin's own logins so Next steps
+# can print the folders to paste there.
 $sessionHosts = @($active | Where-Object { $_.Key -in 'Server', 'SessionWorker' })
-$claudeUnset = @($sessionHosts | Where-Object { $_.Action -eq 'Install' -or -not (Get-JsonValue (Read-AppSettings $_.InstallDir) 'Harness:ClaudeConfigDirectory') })
-$codexUnset = @($sessionHosts | Where-Object { $_.Action -eq 'Install' -or -not (Get-ServiceEnvironment $_.Definition.ServiceName | Where-Object { $_ -like 'CODEX_HOME=*' }) })
-
-if ($ClaudeConfigDirectory) { $ClaudeConfigDirectory = [IO.Path]::GetFullPath($ClaudeConfigDirectory) }
-elseif ($claudeUnset.Count -gt 0 -and -not $PSBoundParameters.ContainsKey('ClaudeConfigDirectory')) {
-    $claude = Find-ClaudeLogin
-    if ($claude) {
-        $details = @($(if ($claude.Plan) { "$($claude.Plan) plan" }), $(if (-not $claude.CliFound) { 'CLI not found' })) | Where-Object { $_ }
-        $suffix = if ($details) { " ($($details -join ', '))" } else { '' }
-        Write-Note "Claude Code login found for ${env:USERNAME}: $($claude.Directory)$suffix"
-        if (Read-YesNo "Run Claude Code models on this host with this login? Sessions will use $env:USERNAME's Claude subscription.") {
-            $ClaudeConfigDirectory = $claude.Directory
-        }
-    }
-    else {
-        Write-Note "No Claude Code login found for $env:USERNAME. Claude Code models need Harness:ClaudeConfigDirectory set later (see Next steps)."
-    }
-}
-
-if ($CodexHome) { $CodexHome = [IO.Path]::GetFullPath($CodexHome) }
-elseif ($codexUnset.Count -gt 0 -and -not $PSBoundParameters.ContainsKey('CodexHome')) {
-    $codex = Find-CodexLogin
-    if ($codex) {
-        $suffix = if ($codex.Plan) { " (ChatGPT $($codex.Plan) plan)" } else { '' }
-        Write-Note "OpenAI ChatGPT/Codex subscription login found for ${env:USERNAME}: $($codex.Directory)$suffix"
-        if ($codex.Plan -eq 'free') { Write-Warning 'The ChatGPT Free plan may not include Codex usage; OpenAI models then fall back to the OpenAI API key.' }
-        if (Read-YesNo "Run OpenAI models on this host with this subscription? Sessions will use $env:USERNAME's ChatGPT plan.") {
-            $CodexHome = $codex.Directory
-        }
-    }
-    else {
-        Write-Note "No OpenAI ChatGPT/Codex subscription login found for $env:USERNAME (run 'codex login' to add one). OpenAI models will use the OpenAI API key from Backend Connections."
-    }
-}
+$claudeLogin = if ($sessionHosts.Count -gt 0) { Find-ClaudeLogin } else { $null }
+$codexLogin = if ($sessionHosts.Count -gt 0) { Find-CodexLogin } else { $null }
 
 #endregion
 
@@ -1085,8 +1070,6 @@ if ($active.Count -gt 0) {
 if ($PublicUrl) { Write-Host "  Public URL:        $PublicUrl" }
 if ($ServerUrl -and $newWorkers.Count -gt 0) { Write-Host "  Server URL:        $ServerUrl" }
 if ($WorkerName -and $newWorkers.Count -gt 0) { Write-Host "  Worker name:       $WorkerName" }
-if ($ClaudeConfigDirectory -and $sessionHosts) { Write-Host "  Claude Code login: $ClaudeConfigDirectory" }
-if ($CodexHome -and $sessionHosts) { Write-Host "  OpenAI login:      $CodexHome" }
 $toInstall = @($(if ($missingPrerequisites.DotNet) { '.NET 10 Hosting Bundle' }), $(if ($missingPrerequisites.Git) { 'Git for Windows' })) | Where-Object { $_ }
 if ($toInstall) { Write-Host "  Prerequisites:     will install $($toInstall -join ', ')" }
 
@@ -1149,6 +1132,7 @@ try {
             if ($previous) { Write-Note "Installed version: $previous" }
             if ($item.Key -eq 'SessionWorker') { Write-Note 'The Session Worker waits for running sessions to finish before stopping (up to ShutdownDrainTimeoutSeconds).' }
             Stop-ComponentService $definition.ServiceName $exePath
+            Assert-HarnessRollbackReady $item $previous $releaseVersion
         }
         else {
             if ((Test-Path $item.InstallDir) -and (Get-ChildItem -Path $item.InstallDir -Force)) {
@@ -1172,7 +1156,6 @@ try {
         if ($migrated -and @($migrated.PSObject.Properties).Count -gt 0) {
             Merge-Json $settings $migrated
             $changed = $true
-            Write-Note "Moved settings customized in appsettings.json to $productionSettingsName."
         }
         switch ($item.Key) {
             'Server' {
@@ -1200,10 +1183,6 @@ try {
                 if ($DeployWorkerApiKey) { Set-JsonValue $settings 'Agent:ApiKey' (ConvertTo-PlainText $DeployWorkerApiKey); $changed = $true }
             }
         }
-        if ($ClaudeConfigDirectory -and $item.Key -in 'Server', 'SessionWorker') {
-            Set-JsonValue $settings 'Harness:ClaudeConfigDirectory' $ClaudeConfigDirectory
-            $changed = $true
-        }
         if ($changed) { Write-JsonFile $productionPath $settings }
 
         if (-not $isUpgrade) {
@@ -1212,9 +1191,6 @@ try {
             Write-Note "Registered service '$($definition.ServiceName)' (LocalSystem, automatic start)."
         }
         & sc.exe failure $definition.ServiceName reset= 86400 actions= restart/60000/restart/60000/restart/60000 | Out-Null
-        if ($CodexHome -and $item.Key -in 'Server', 'SessionWorker') {
-            Set-ServiceEnvironmentVariable $definition.ServiceName 'CODEX_HOME' $CodexHome
-        }
 
         $healthy = $null
         if (-not $NoStart) {
@@ -1266,11 +1242,22 @@ foreach ($result in $results | Where-Object { $_.Action -eq 'Uninstall' -and $_.
     Write-Note "$($result.Item.Definition.Label): delete this machine's host on the Hosts page, and revoke its host API key."
 }
 if (@($results | Where-Object { $_.Action -ne 'Uninstall' -and $_.Item.Key -in 'Server', 'SessionWorker' }).Count -gt 0) {
-    if (-not $ClaudeConfigDirectory) {
-        Write-Note "Claude Code models: sign in with 'claude auth login', set Harness:ClaudeConfigDirectory to that account's .claude folder (or run this script again), and restart the service."
+    $loginLocation = "the host's Agent Logins section (Hosts page, or Polygent Code -> Settings in the open-source edition)"
+    if ($claudeLogin) {
+        $details = @($(if ($claudeLogin.Plan) { "$($claudeLogin.Plan) plan" }), $(if (-not $claudeLogin.CliFound) { 'CLI not found' })) | Where-Object { $_ }
+        $suffix = if ($details) { " ($($details -join ', '))" } else { '' }
+        Write-Note "Claude Code models: to run them with ${env:USERNAME}'s Claude subscription$suffix, set Claude Code Login Folder to $($claudeLogin.Directory) in $loginLocation."
     }
-    if (-not $CodexHome) {
-        Write-Note "OpenAI subscription: sign in with 'codex login' and run this script again to share it, or save an OpenAI API key in Backend Connections."
+    else {
+        Write-Note "Claude Code models: sign in with 'claude auth login', then set Claude Code Login Folder to that account's .claude folder in $loginLocation."
+    }
+    if ($codexLogin) {
+        $suffix = if ($codexLogin.Plan) { " (ChatGPT $($codexLogin.Plan) plan)" } else { '' }
+        Write-Note "OpenAI subscription: to run OpenAI models with ${env:USERNAME}'s ChatGPT subscription$suffix, set Codex Login Folder to $($codexLogin.Directory) in $loginLocation."
+        if ($codexLogin.Plan -eq 'free') { Write-Warning 'The ChatGPT Free plan may not include Codex usage; OpenAI models then fall back to the OpenAI API key.' }
+    }
+    else {
+        Write-Note "OpenAI subscription: sign in with 'codex login' and set Codex Login Folder to that account's .codex folder in $loginLocation, or save an OpenAI API key in Backend Connections."
     }
     Write-Note 'Check Backend readiness on the Hosts page for the status of every command-line model.'
 }
