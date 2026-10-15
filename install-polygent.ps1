@@ -257,9 +257,50 @@ function Set-JsonValue($Object, [string] $Path, $Value) {
     $node | Add-Member -NotePropertyName $parts[-1] -NotePropertyValue $Value -Force
 }
 
+# The services load appsettings through .NET configuration, which accepts comments and trailing
+# commas, so hand-edited files often contain them. Windows PowerShell's ConvertFrom-Json rejects both
+# ("Invalid JSON primitive: ."), so they are removed outside strings first.
+function ConvertFrom-JsonText([string] $Text) {
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $out = New-Object Text.StringBuilder $Text.Length
+    $inString = $false
+    $i = 0
+    while ($i -lt $Text.Length) {
+        $c = $Text[$i]
+        $next = if ($i + 1 -lt $Text.Length) { $Text[$i + 1] } else { [char] 0 }
+        if ($inString) {
+            [void] $out.Append($c)
+            if ($c -eq [char] '\') { [void] $out.Append($next); $i += 2; continue }
+            if ($c -eq [char] '"') { $inString = $false }
+            $i++
+            continue
+        }
+        if ($c -eq [char] '/' -and $next -eq [char] '/') {
+            $end = $Text.IndexOf("`n", $i)
+            $i = if ($end -lt 0) { $Text.Length } else { $end }
+            continue
+        }
+        if ($c -eq [char] '/' -and $next -eq [char] '*') {
+            $end = $Text.IndexOf('*/', $i + 2)
+            $i = if ($end -lt 0) { $Text.Length } else { $end + 2 }
+            continue
+        }
+        if ($c -eq [char] '}' -or $c -eq [char] ']') {
+            $j = $out.Length - 1
+            while ($j -ge 0 -and [char]::IsWhiteSpace($out[$j])) { $j-- }
+            if ($j -ge 0 -and $out[$j] -eq [char] ',') { [void] $out.Remove($j, 1) }
+        }
+        if ($c -eq [char] '"') { $inString = $true }
+        [void] $out.Append($c)
+        $i++
+    }
+    return $out.ToString() | ConvertFrom-Json
+}
+
 function Read-JsonFile([string] $Path) {
     if (-not (Test-Path $Path)) { return $null }
-    return Get-Content -Raw -Path $Path | ConvertFrom-Json
+    try { return ConvertFrom-JsonText (Get-Content -Raw -Path $Path) }
+    catch { throw "Could not parse '$Path' as JSON: $($_.Exception.Message)" }
 }
 
 function Write-JsonFile([string] $Path, $Value) {
@@ -326,7 +367,7 @@ function Get-ReleaseAppSettings([string] $Version, $Definition, [string] $TempRo
             $entry = $archive.GetEntry('appsettings.json')
             if (-not $entry) { return $null }
             $reader = New-Object IO.StreamReader($entry.Open())
-            try { return $reader.ReadToEnd() | ConvertFrom-Json } finally { $reader.Dispose() }
+            try { return ConvertFrom-JsonText $reader.ReadToEnd() } finally { $reader.Dispose() }
         }
         finally { $archive.Dispose() }
     }
