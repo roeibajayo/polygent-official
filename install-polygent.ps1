@@ -876,13 +876,30 @@ function Install-PackageFiles($Item, [string] $Staging, [string] $Version, [swit
 # The worker stages versions and writes its switch files, and the launcher replaces updates\state.json, as the
 # service account. LocalSystem already can; a service moved to its own account is granted Modify on versions\
 # and updates\ only, never on the install folder.
+function Test-LocalSystemAccount([string] $Account) {
+    return -not $Account -or $Account -in @('LocalSystem', '.\LocalSystem', 'NT AUTHORITY\SYSTEM')
+}
+
+# The service manager writes a local account as ".\name", which neither icacls nor NTAccount resolves.
+# Returns the account's SID, or $null when it does not resolve.
+function Resolve-AccountSid([string] $Account) {
+    $name = if ($Account -like '.\*') { "$env:COMPUTERNAME\$($Account.Substring(2))" } else { $Account }
+    try { return ([Security.Principal.NTAccount] $name).Translate([Security.Principal.SecurityIdentifier]).Value }
+    catch { return $null }
+}
+
 function Grant-LauncherAccess([string] $ServiceName, [string] $InstallDir) {
     $account = (Get-InstalledService $ServiceName).StartName
-    if (-not $account -or $account -in @('LocalSystem', '.\LocalSystem', 'NT AUTHORITY\SYSTEM')) { return }
+    if (Test-LocalSystemAccount $account) { return }
+    $sid = Resolve-AccountSid $account
     foreach ($name in 'versions', 'updates') {
         $path = Join-Path $InstallDir $name
         New-Item -ItemType Directory -Force -Path $path | Out-Null
-        & icacls.exe $path /grant "$($account):(OI)(CI)M" | Out-Null
+        if (-not $sid) {
+            Write-Warning "Could not resolve the service account $account, so it was not granted Modify on '$path'; the worker cannot follow the server's version."
+            continue
+        }
+        & icacls.exe $path /grant "*$($sid):(OI)(CI)M" | Out-Null
         if ($LASTEXITCODE -ne 0) { Write-Warning "Could not grant $account Modify on '$path'; the worker cannot follow the server's version." }
     }
 }
@@ -1477,6 +1494,7 @@ if ($active.Count -gt 0) {
 }
 
 Write-Step 'Plan'
+$customAccounts = $false
 foreach ($item in $plan) {
     $label = switch ($item.Action) {
         'Install' { "install v$releaseVersion" }
@@ -1493,13 +1511,20 @@ foreach ($item in $plan) {
     Write-Host ("  {0,-18} {1}" -f '', $item.InstallDir)
     if ($item.DataDir) { Write-Host ("  {0,-18} StoragePath: {1}" -f '', $item.DataDir) }
     if ($item.ServerId) { Write-Host ("  {0,-18} Agent:ServerId: {1} (was not set)" -f '', $item.ServerId) }
+    # An upgrade changes the service's command line only; a service moved to its own account keeps it.
+    $keptAccount = if ($item.Action -eq 'Upgrade') { (Get-InstalledService $item.Definition.ServiceName).StartName }
+    if (-not (Test-LocalSystemAccount $keptAccount)) {
+        $customAccounts = $true
+        Write-Host ("  {0,-18} Service account: {1} (kept)" -f '', $keptAccount)
+    }
     if ($item.Action -eq 'Upgrade' -and $item.Key -eq 'Server' -and -not $SkipCompaction) {
         Write-Host ("  {0,-18} SQLite database: backed up and compacted only for verified supporting releases (-SkipCompaction to skip)" -f '')
     }
 }
 if ($active.Count -gt 0) {
     Write-Host "  Release:           $releaseVersion ($Repository)"
-    Write-Host '  Service account:   LocalSystem, automatic start, restart on failure'
+    if ($customAccounts) { Write-Host '  Services:          automatic start, restart on failure; new services run as LocalSystem' }
+    else { Write-Host '  Service account:   LocalSystem, automatic start, restart on failure' }
 }
 if ($PublicUrl) { Write-Host "  Public URL:        $PublicUrl" }
 if ($ServerUrl -and $connectingWorkers.Count -gt 0) { Write-Host "  Server URL:        $ServerUrl" }
