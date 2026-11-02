@@ -205,8 +205,72 @@ $manifestName = 'install-manifest.txt'
 # next to it. The state lives in updates\ because a custom service account may modify only versions\ and updates\.
 $launcherExe = 'Polygent.WorkerLauncher.exe'
 $launcherStateName = 'updates\state.json'
+# The release manifest public key: base64 P-256 SubjectPublicKeyInfo (paid/scripts/New-ReleaseSigningKey.ps1). Set it
+# before publishing a signed release; it must equal the POLYGENT_RELEASE_PUBLIC_KEY repository variable. It is
+# Polygent's own key, not the Authenticode certificate, so a certificate renewal never needs a new installer.
+$releasePublicKey = 'MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAESwEWL9dS3GyHXR0YfxCae0Uwm9R8t/+nQ8W/7io/30HT3x4K7Jjveq9oFS5BUky9TjzaUUqgXWvM7DDVDwnqJg=='
 
 #region Helpers
+
+# Verifies an extracted package against its signed release-manifest.json before anything is stopped or replaced:
+# the same check each executable makes at startup (paid/src/release-integrity/ReleaseIntegrity.cs).
+function Assert-ReleaseIntegrity([string] $Directory, [string] $Component, [string] $Version, [string] $PublicKey = $releasePublicKey) {
+    $root = [IO.Path]::GetFullPath($Directory).TrimEnd('\', '/')
+    $manifestPath = Join-Path $root 'release-manifest.json'
+    $signaturePath = Join-Path $root 'release-manifest.signature.json'
+    # Explicit compatibility boundary: the historical 1.7.8 and earlier releases predate signed packages.
+    if (-not (Test-Path -LiteralPath $manifestPath) -and [version](($Version -replace '^v', '') -split '-')[0] -le [version]'1.7.8') { return }
+    # A P-256 SubjectPublicKeyInfo is a fixed 27-byte header followed by the point's X and Y. Windows PowerShell's
+    # .NET Framework cannot import SubjectPublicKeyInfo, so the point is read from it directly.
+    if ($PublicKey -cnotmatch '^MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE[A-Za-z0-9+/]{86}==$') { throw 'This installer has no pinned release public key. Download the current installer and run it again.' }
+    if (-not (Test-Path -LiteralPath $manifestPath) -or -not (Test-Path -LiteralPath $signaturePath)) { throw "Release integrity check failed: the $Component package has no signed release manifest." }
+    if ((Get-Item -LiteralPath $manifestPath).Length -gt 4194304 -or (Get-Item -LiteralPath $signaturePath).Length -gt 65536) { throw 'Release integrity check failed: the release manifest is oversized.' }
+    $bytes = [IO.File]::ReadAllBytes($manifestPath)
+    $signature = [IO.File]::ReadAllText($signaturePath) | ConvertFrom-Json
+    $signatureBytes = [Convert]::FromBase64String([string]$signature.signature)
+    $spki = [Convert]::FromBase64String($PublicKey)
+    $point = New-Object Security.Cryptography.ECPoint
+    $point.X = [byte[]]$spki[27..58]
+    $point.Y = [byte[]]$spki[59..90]
+    $parameters = New-Object Security.Cryptography.ECParameters
+    $parameters.Curve = [Security.Cryptography.ECCurve+NamedCurves]::nistP256
+    $parameters.Q = $point
+    $key = [Security.Cryptography.ECDsa]::Create($parameters)
+    try {
+        if ($signature.algorithm -cne 'ES256' -or $signatureBytes.Length -ne 64 -or -not $key.VerifyData($bytes, $signatureBytes, [Security.Cryptography.HashAlgorithmName]::SHA256)) {
+            throw "Release integrity check failed: the $Component package is not signed by the Polygent release key."
+        }
+    } finally { $key.Dispose() }
+    $manifest = [Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json
+    if ($manifest.testSigning) { throw "Release integrity check failed: the $Component package is test-signed." }
+    if ($manifest.schema -ne 1 -or $manifest.component -cne $Component -or $manifest.version -cne $Version) {
+        throw "Release integrity check failed: the package is signed as $($manifest.component) $($manifest.version), not $Component $Version."
+    }
+    $seen = @{}
+    $directories = @{$root = $true}
+    foreach ($file in $manifest.files) {
+        $relative = [string]$file.path
+        if (-not $relative -or $relative.Contains('\') -or $relative.Contains(':') -or @($relative.Split('/') | Where-Object { $_ -in @('', '.', '..') }).Count -gt 0 -or $seen.ContainsKey($relative)) { throw "Release integrity check failed: the manifest lists an invalid or duplicate path '$relative'." }
+        $seen[$relative] = $true
+        $path = [IO.Path]::GetFullPath((Join-Path $root $relative))
+        if (-not $path.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase)) { throw "Release integrity check failed: the manifest path '$relative' escapes the package." }
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Release integrity check failed for ${relative}: the file is missing." }
+        for ($current = $path; $current.Length -gt $root.Length; $current = [IO.Path]::GetDirectoryName($current)) {
+            if (([IO.File]::GetAttributes($current) -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Release integrity check failed for ${relative}: linked files are not allowed." }
+        }
+        if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $file.sha256) { throw "Release integrity check failed for ${relative}: the file differs from the signed release." }
+        $directories[[IO.Path]::GetDirectoryName($path)] = $true
+    }
+    if ($seen.Count -eq 0) { throw 'Release integrity check failed: the manifest lists no files.' }
+    foreach ($folder in $directories.Keys) {
+        foreach ($file in Get-ChildItem -LiteralPath $folder -File) {
+            if ($file.Name -match '(?i)(\.dll|\.exe|\.deps\.json|\.runtimeconfig\.json)$') {
+                $relative = $file.FullName.Substring($root.Length + 1).Replace('\', '/')
+                if (-not $seen.ContainsKey($relative)) { throw "Release integrity check failed for ${relative}: the file is not part of the signed release." }
+            }
+        }
+    }
+}
 
 function Write-Step([string] $Message) { Write-Host "==> $Message" -ForegroundColor Cyan }
 function Write-Note([string] $Message) { Write-Host "    $Message" }
@@ -811,6 +875,20 @@ function Sync-PackageFiles([string] $Staging, [string] $Target, [switch] $KeepAp
     if ($excluded.Count -gt 0) { $robocopyArgs += @('/XF') + $excluded }
     & robocopy.exe @robocopyArgs | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "Copying files to '$Target' failed (robocopy exit code $LASTEXITCODE)." }
+
+    # A signed package does not start next to an executable it does not list (release integrity), so the ones a
+    # manual install, an older flat worker, or anyone else left in the package's folders are removed.
+    if (Test-Path -LiteralPath (Join-Path $Staging 'release-manifest.json')) {
+        foreach ($folder in @($newFiles | ForEach-Object { Split-Path -Parent $_ } | Select-Object -Unique)) {
+            foreach ($file in Get-ChildItem -LiteralPath $(if ($folder) { Join-Path $Target $folder } else { $Target }) -File) {
+                $relative = if ($folder) { Join-Path $folder $file.Name } else { $file.Name }
+                if ($file.Name -match '(?i)(\.dll|\.exe|\.deps\.json|\.runtimeconfig\.json)$' -and $relative -notin $newFiles -and -not (Test-Preserved $relative)) {
+                    Remove-Item -LiteralPath $file.FullName -Force
+                    Write-Note "Removed $relative from $Target`: it is not part of this release."
+                }
+            }
+        }
+    }
 
     [IO.File]::WriteAllLines($manifestPath, [string[]] $newFiles)
 }
@@ -1569,6 +1647,7 @@ try {
         $staging = Join-Path $tempRoot $definition.Asset
         Save-GitHubAsset $release $assetName $zipPath
         Expand-Archive -Path $zipPath -DestinationPath $staging -Force
+        Assert-ReleaseIntegrity $staging $definition.Asset $releaseVersion
         if (-not (Test-Path (Join-Path $staging $definition.Exe))) { throw "$assetName does not contain $($definition.Exe)." }
         $useLauncher = Test-LauncherPackage $item $staging
 
