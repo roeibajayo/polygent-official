@@ -11,7 +11,14 @@
     Running it again upgrades in place: the service is stopped, the files of the previous
     package are replaced (including appsettings.json, so new defaults arrive), and
     appsettings.Production.json, logs and crash.log are kept. Settings an older install kept in
-    appsettings.json are moved to appsettings.Production.json.
+    appsettings.json are moved to appsettings.Production.json. For verified supporting releases,
+    a Server on SQLite then has its database compacted before it starts again (after a verified
+    full backup); -SkipCompaction skips this.
+
+    A Session or Deployment Worker runs from versions\<version> in its folder under a small launcher,
+    which is its service. When the Server is upgraded, each worker downloads its package of the new
+    version from the Server and switches to it, and falls back to the version it ran when the new one
+    does not start; the first run of this script on an older worker moves it to this layout.
 
     Missing prerequisites (.NET 10 Hosting Bundle, Git for Windows) are downloaded from their
     vendors, hash-verified, and installed. Services run as LocalSystem.
@@ -76,6 +83,24 @@ param(
     # SecureString or plain text; omit it to be prompted.
     $SessionWorkerApiKey,
 
+    # Session Worker: WorkerConnects (the worker connects to the server with a host API key) or
+    # ServerConnects (the server connects to this worker on -SessionWorkerListenPort; the worker never
+    # connects to the server, and pairs with a one-time code instead of a key). Default: ask.
+    [string] $SessionWorkerConnectionMode,
+
+    # Session Worker in ServerConnects mode: the HTTPS port the server connects to. Default: 443.
+    [int] $SessionWorkerListenPort = 443,
+
+    # Session Worker in ServerConnects mode: the host name the server connects to, such as
+    # worker.example.com. Set, the worker shares the port with IIS sites of other host names (HTTP.sys).
+    # Default: none (the worker takes the whole port).
+    [string] $SessionWorkerListenHostname,
+
+    # Session Worker in ServerConnects mode: SelfSigned (the worker's own certificate, trusted by the
+    # pairing code) or MachineStore (a CA certificate for -SessionWorkerListenHostname in
+    # Cert:\LocalMachine\My, trusted by its issuer; renewals need no new pairing). Default: SelfSigned.
+    [string] $SessionWorkerListenCertificate,
+
     # Deployment Worker host API key (Hosts -> API Keys -> New API Key -> Deploy Worker).
     # SecureString or plain text; omit it to be prompted.
     $DeployWorkerApiKey,
@@ -89,6 +114,9 @@ param(
 
     # Fail instead of installing missing prerequisites (.NET 10 Hosting Bundle, Git).
     [switch] $SkipPrerequisites,
+
+    # Server upgrades: do not compact the SQLite database while the service is stopped.
+    [switch] $SkipCompaction,
 
     # GitHub repository that publishes the release assets.
     [string] $Repository = 'roeibajayo/polygent-official'
@@ -143,11 +171,26 @@ foreach ($name in @($Components)) {
     if ($name -and $name -notin 'Server', 'SessionWorker', 'DeployWorker') { throw "-Components accepts Server, SessionWorker, DeployWorker; got '$name'." }
 }
 if ($Action -and $Action -notin 'Upgrade', 'Uninstall') { throw "-Action accepts Upgrade or Uninstall; got '$Action'." }
+if ($SessionWorkerConnectionMode -and $SessionWorkerConnectionMode -notin 'WorkerConnects', 'ServerConnects') {
+    throw "-SessionWorkerConnectionMode accepts WorkerConnects or ServerConnects; got '$SessionWorkerConnectionMode'."
+}
+if ($SessionWorkerListenPort -lt 1 -or $SessionWorkerListenPort -gt 65535) { throw "-SessionWorkerListenPort must be a TCP port; got $SessionWorkerListenPort." }
+if ($SessionWorkerListenHostname -and [Uri]::CheckHostName($SessionWorkerListenHostname) -ne 'Dns') {
+    throw "-SessionWorkerListenHostname must be a DNS host name such as worker.example.com; got '$SessionWorkerListenHostname'."
+}
+if ($SessionWorkerListenCertificate -and $SessionWorkerListenCertificate -notin 'SelfSigned', 'MachineStore') {
+    throw "-SessionWorkerListenCertificate accepts SelfSigned or MachineStore; got '$SessionWorkerListenCertificate'."
+}
+if ($SessionWorkerListenCertificate -eq 'MachineStore' -and -not $SessionWorkerListenHostname) {
+    throw '-SessionWorkerListenCertificate MachineStore needs -SessionWorkerListenHostname: the host name the certificate is issued for.'
+}
+# The worker marks its HTTP.sys certificate bindings with this application ID (HttpSysCertificateBinding).
+$script:SessionWorkerHttpSysAppId = '{5b0f7c1e-3d2a-4f6b-9e8c-7a1d2c3b4e5f}'
 $ProgressPreference = 'SilentlyContinue'
 
 $definitions = [ordered]@{
-    Server        = @{ Label = 'Server'; Summary = 'Web app and API; also runs sessions itself'; Asset = 'server'; Folder = 'server'; Exe = 'Polygent.Api.exe'; ServiceName = 'Polygent'; DisplayName = 'Polygent Server' }
-    SessionWorker = @{ Label = 'Session Worker'; Summary = 'Runs agent sessions on this machine for a remote Server'; Asset = 'session-worker'; Folder = 'session-worker'; Exe = 'Polygent.SessionWorker.exe'; ServiceName = 'PolygentSessionWorker'; DisplayName = 'Polygent Session Worker' }
+    Server        = @{ Label = 'Server'; Summary = 'Web app and API; sessions run on Session Workers'; Asset = 'server'; Folder = 'server'; Exe = 'Polygent.Api.exe'; ServiceName = 'Polygent'; DisplayName = 'Polygent Server' }
+    SessionWorker = @{ Label = 'Session Worker'; Summary = 'Runs agent sessions on this machine for a Server'; Asset = 'session-worker'; Folder = 'session-worker'; Exe = 'Polygent.SessionWorker.exe'; ServiceName = 'PolygentSessionWorker'; DisplayName = 'Polygent Session Worker' }
     DeployWorker  = @{ Label = 'Deployment Worker'; Summary = 'Runs preview deployment slots on this machine'; Asset = 'deploy-worker'; Folder = 'deploy-worker'; Exe = 'Polygent.DeployWorker.exe'; ServiceName = 'PolygentDeploymentWorker'; DisplayName = 'Polygent Deployment Worker' }
 }
 
@@ -157,6 +200,11 @@ $baselineName = 'install-baseline.json'  # copy of the installed package's appse
 $preservedNames = @($productionSettingsName, $baselineName, 'crash.log')
 $preservedDirs = @('logs')
 $manifestName = 'install-manifest.txt'
+# A worker package that carries launcher\ runs from versions\<version> under Polygent.WorkerLauncher, which is
+# its service. The launcher owns updates\state.json (the version it starts); the worker writes its switch files
+# next to it. The state lives in updates\ because a custom service account may modify only versions\ and updates\.
+$launcherExe = 'Polygent.WorkerLauncher.exe'
+$launcherStateName = 'updates\state.json'
 
 #region Helpers
 
@@ -345,12 +393,12 @@ function Get-JsonOverrides($Current, $Baseline) {
 # appsettings.json belongs to the package and is replaced on every upgrade so new defaults arrive.
 # Everything this script or the operator sets lives in appsettings.Production.json, which the
 # services load on top of it (they run in the Production environment) and which upgrades keep.
-# This returns the effective configuration: appsettings.json overlaid by appsettings.Production.json.
-function Read-AppSettings([string] $Directory) {
-    $settings = Read-JsonFile (Join-Path $Directory 'appsettings.json')
+# This returns appsettings.json overlaid by the selected environment's settings (Production by default).
+function Read-AppSettings([string] $Directory, [string] $EnvironmentName = 'Production') {
+    $settings = Read-JsonFile (Join-Path (Get-PackageDir $Directory) 'appsettings.json')
     if (-not $settings) { $settings = [pscustomobject]@{} }
-    $production = Read-JsonFile (Join-Path $Directory $productionSettingsName)
-    if ($production) { Merge-Json $settings $production -Override }
+    $overrides = Read-JsonFile (Join-Path $Directory "appsettings.$EnvironmentName.json")
+    if ($overrides) { Merge-Json $settings $overrides -Override }
     return $settings
 }
 
@@ -396,6 +444,48 @@ function Get-InstalledService([string] $Name) {
     return Get-CimInstance -ClassName Win32_Service -Filter "Name='$Name'"
 }
 
+# The folder a component's package runs from: versions\<current> of a worker under the launcher, else the
+# install folder itself.
+function Get-PackageDir([string] $InstallDir) {
+    $state = try { Read-JsonFile (Join-Path $InstallDir $launcherStateName) } catch { $null }
+    if ($state -and "$($state.current)") { return Join-Path $InstallDir "versions\$($state.current)" }
+    return $InstallDir
+}
+
+# Every process started from a file under the folder: a worker's launcher and the worker it runs.
+function Get-ProcessesUnder([string] $Directory) {
+    $prefix = [IO.Path]::GetFullPath($Directory).TrimEnd('\') + '\'
+    return @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) })
+}
+
+# The worker's own arguments in a service command line: everything after the executable, or after the
+# launcher's "--" separator when the service runs the launcher.
+function Get-ServiceWorkerArguments([string] $PathName) {
+    $pathName = $PathName.Trim()
+    if ($pathName.StartsWith('"')) { $exe = $pathName.Substring(1, $pathName.IndexOf('"', 1) - 1); $rest = $pathName.Substring($pathName.IndexOf('"', 1) + 1) }
+    else { $exe = ($pathName -split ' ')[0]; $rest = $pathName.Substring($exe.Length) }
+    $rest = $rest.Trim()
+    if ((Split-Path -Leaf $exe) -ne $launcherExe) { return $rest }
+    if ($rest -match '(?:^|\s)--(?:\s+(?<args>.*))?$') { return "$($Matches['args'])".Trim() }
+    return ''
+}
+
+# Points an existing service at the executable this run installed, keeping arguments an operator gave the
+# worker (behind the launcher's "--" separator when the service runs the launcher). A service already running
+# that executable keeps its command line.
+function Set-ServiceCommandLine([string] $Name, [string] $CommandLine, [string] $ExePath) {
+    $service = Get-InstalledService $Name
+    if ((Get-ServiceExePath $service) -eq $ExePath) { return }
+    $workerArguments = Get-ServiceWorkerArguments $service.PathName
+    if ($workerArguments) {
+        $separator = if ((Split-Path -Leaf $ExePath) -eq $launcherExe) { ' -- ' } else { ' ' }
+        $CommandLine = "$CommandLine$separator$workerArguments"
+    }
+    $result = Invoke-CimMethod -InputObject $service -MethodName Change -Arguments @{ PathName = $CommandLine }
+    if ($result.ReturnValue -ne 0) { throw "Could not change the command line of service '$Name' (Win32_Service.Change returned $($result.ReturnValue))." }
+    Write-Note "Service '$Name' now runs $CommandLine."
+}
+
 function Get-ServiceExePath($Service) {
     $pathName = $Service.PathName.Trim()
     if ($pathName.StartsWith('"')) { return $pathName.Substring(1, $pathName.IndexOf('"', 1) - 1) }
@@ -423,8 +513,8 @@ function Test-StopKeyPressed {
 
 # The stop is requested without blocking so the wait can be reported, and skipped with S while a
 # Session Worker drains. A service still running after its drain time plus a grace period has its
-# process ended, so an upgrade never waits forever.
-function Stop-ComponentService([string] $Name, [string] $ExePath, [int] $DrainSeconds = 0) {
+# processes (every process started from its install folder) ended, so an upgrade never waits forever.
+function Stop-ComponentService([string] $Name, [string] $InstallDir, [int] $DrainSeconds = 0) {
     $service = Get-Service -Name $Name
     if ($service.Status -ne 'Stopped') {
         Write-Note "Stopping service '$Name'..."
@@ -443,7 +533,7 @@ function Stop-ComponentService([string] $Name, [string] $ExePath, [int] $DrainSe
             if ($skipped -or $elapsed -ge $budget) {
                 $reason = if ($skipped) { 'Stop requested' } else { "Service '$Name' did not stop within $elapsed s" }
                 Write-Warning "$reason; ending its process. Work it was still running is abandoned."
-                Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $ExePath } | Stop-Process -Force
+                Get-ProcessesUnder $InstallDir | Stop-Process -Force -ErrorAction SilentlyContinue
                 break
             }
             if ($elapsed -ge $nextReport) {
@@ -453,9 +543,9 @@ function Stop-ComponentService([string] $Name, [string] $ExePath, [int] $DrainSe
             Start-Sleep -Milliseconds 500
         }
     }
-    # The process can outlive the SCM "stopped" state briefly and keep its files locked.
+    # The processes can outlive the SCM "stopped" state briefly and keep their files locked.
     $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $ExePath }) -and (Get-Date) -lt $deadline) {
+    while ((Get-ProcessesUnder $InstallDir).Count -gt 0 -and (Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
     }
 }
@@ -466,7 +556,7 @@ function Assert-HarnessRollbackReady($Item, [string] $InstalledVersion, [string]
     $target = $TargetVersion.TrimStart('v')
     if (-not $installed) { throw 'Cannot establish the installed harness version; refusing to replace its binaries.' }
     if ([version](($target -split '-')[0]) -gt [version](($installed -split '-')[0]) -or $target -eq $installed) { return }
-    if (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq (Join-Path $Item.InstallDir $Item.Definition.Exe) }) {
+    if ((Get-ProcessesUnder $Item.InstallDir).Count -gt 0) {
         throw 'The harness host is still running. Stop it before preparing or installing a rollback.'
     }
 
@@ -499,13 +589,87 @@ function Assert-HarnessRollbackReady($Item, [string] $InstalledVersion, [string]
     }
 }
 
+# Set only after verifying --sqlite-compact in a published server package; older binaries start the server.
+[version] $minimumCompactionVersion = $null
+
+# Compacts the Server's SQLite database while the service is stopped for an upgrade: with the new
+# release's binaries, before they migrate it, so the verified full backup it writes first is also a
+# pre-upgrade backup. It runs with the service's environment on top of this process's. Returns $null
+# when skipped, else the exit code (0 compacted or nothing to reclaim; 1 refused or failed with the
+# database intact; 2 the database could not be verified and must be restored before starting) and the
+# backup it wrote.
+function Invoke-DatabaseCompaction($Item, [string] $TargetVersion) {
+    if ($null -eq $minimumCompactionVersion) {
+        Write-Note 'Database compaction has no verified supporting release yet; skipped.'
+        return $null
+    }
+    if ([version](($TargetVersion.TrimStart('v') -split '-')[0]) -lt $minimumCompactionVersion) {
+        Write-Note "Database compaction needs release $minimumCompactionVersion or later; skipped."
+        return $null
+    }
+
+    $serviceSettings = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\$($Item.Definition.ServiceName)" -ErrorAction SilentlyContinue
+    $serviceEnvironment = @(foreach ($entry in @($serviceSettings.Environment)) {
+        if ("$entry" -match '^([^=]+)=(.*)$') { [pscustomobject]@{ Name = $Matches[1]; Value = $Matches[2] } }
+    })
+
+    $environment = @{}
+    foreach ($variable in $serviceEnvironment) { $environment[$variable.Name] = $variable.Value }
+    foreach ($name in 'DOTNET_ENVIRONMENT', 'ASPNETCORE_ENVIRONMENT') {
+        if (-not $environment.ContainsKey($name)) { $environment[$name] = [Environment]::GetEnvironmentVariable($name, 'Machine') }
+    }
+    $environmentName = if ($environment.DOTNET_ENVIRONMENT) { $environment.DOTNET_ENVIRONMENT } elseif ($environment.ASPNETCORE_ENVIRONMENT) { $environment.ASPNETCORE_ENVIRONMENT } else { 'Production' }
+    $settings = Read-AppSettings $Item.InstallDir $environmentName
+    $configurationKeys = @{ StoragePath = 'StoragePath'; Database__Provider = 'Database:Provider'; Database__ConnectionString = 'Database:ConnectionString' }
+    foreach ($name in $configurationKeys.Keys) {
+        if ($environment.ContainsKey($name)) { continue }
+        $value = Get-JsonValue $settings $configurationKeys[$name]
+        $machineValue = [Environment]::GetEnvironmentVariable($name, 'Machine')
+        if ($null -ne $machineValue) { $value = $machineValue }
+        $environment[$name] = $value
+    }
+    $provider = $environment.Database__Provider
+    if ("$provider" -notin 'Sqlite', '1') {
+        Write-Note "Database provider is '$provider'; SQLite compaction skipped."
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($environment.StoragePath) -and [string]::IsNullOrEmpty($environment.Database__ConnectionString)) {
+        Write-Warning "Database compaction was not run: the service has no explicit StoragePath or Database:ConnectionString, and its default depends on its account, not the administrator running this script. Set either setting to the service's existing database location, then retry. No database was opened or created."
+        return [pscustomobject]@{ ExitCode = 1; BackupPath = $null }
+    }
+
+    Write-Note 'Compacting the SQLite database (a verified full backup is written first)...'
+    $saved = @{}
+    foreach ($name in $environment.Keys) {
+        $saved[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        [Environment]::SetEnvironmentVariable($name, $environment[$name], 'Process')
+    }
+    $captured = @{ BackupPath = $null }
+    # Refusals arrive on stderr; under 'Stop' Windows PowerShell would turn the first line into an exception.
+    $ErrorActionPreference = 'Continue'
+    try {
+        & (Join-Path $Item.InstallDir $Item.Definition.Exe) --sqlite-compact --yes 2>&1 | ForEach-Object {
+            $line = "$_"
+            if ($line.StartsWith('Backup: ')) { $captured.BackupPath = $line.Substring('Backup: '.Length) }
+            Write-Note "  $line"
+        }
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name], 'Process') }
+    }
+    return [pscustomobject]@{ ExitCode = $exitCode; BackupPath = $captured.BackupPath }
+}
+
 function Get-ComponentState([string] $Key) {
     $service = Get-InstalledService $definitions[$Key].ServiceName
     if (-not $service) { return [pscustomobject]@{ Installed = $false; Service = $null; Status = 'Not installed'; Version = $null; InstallDir = $null } }
-    $exe = Get-ServiceExePath $service
+    # Under the launcher the service runs the launcher in the install folder; the version is the worker's.
+    $installDir = Split-Path -Parent (Get-ServiceExePath $service)
+    $exe = Join-Path (Get-PackageDir $installDir) $definitions[$Key].Exe
     $version = (Get-Item -Path $exe -ErrorAction SilentlyContinue).VersionInfo.ProductVersion
     $version = if ($version) { 'v' + ($version -split '\+')[0] } else { 'unknown version' }
-    return [pscustomobject]@{ Installed = $true; Service = $service; Status = $service.State; Version = $version; InstallDir = (Split-Path -Parent $exe) }
+    return [pscustomobject]@{ Installed = $true; Service = $service; Status = $service.State; Version = $version; InstallDir = $installDir }
 }
 
 # Only folders this script created or configured are ever deleted; this guards against a
@@ -535,12 +699,33 @@ function Remove-EmptyDirectory([string] $Path) {
     }
 }
 
+# A Session Worker with a ListenHostname bound its certificate to that name in HTTP.sys; the binding
+# outlives the service, so it is removed here, and only while it is still the worker's.
+function Remove-SessionWorkerHttpSysBinding($Item) {
+    $settingsPath = Join-Path $Item.InstallDir $productionSettingsName
+    if (-not (Test-Path $settingsPath)) { return }
+    $settings = Read-JsonFile $settingsPath
+    $hostname = Get-JsonValue $settings 'ListenHostname'
+    if (-not $hostname) { return }
+    $port = Get-JsonValue $settings 'ListenPort'
+    if (-not $port) { $port = 443 }
+
+    $endpoint = "$($hostname):$port"
+    $binding = & netsh.exe http show sslcert "hostnameport=$endpoint" 2>&1
+    if ($LASTEXITCODE -ne 0 -or -not (($binding -join "`n") -match [regex]::Escape($script:SessionWorkerHttpSysAppId))) { return }
+    & netsh.exe http delete sslcert "hostnameport=$endpoint" | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Note "Removed the HTTP.sys certificate binding of $endpoint." }
+    else { Write-Warning "Could not remove the HTTP.sys certificate binding of $endpoint; run: netsh http delete sslcert hostnameport=$endpoint" }
+}
+
 function Uninstall-Component($Item) {
     $definition = $Item.Definition
-    Stop-ComponentService $definition.ServiceName (Join-Path $Item.InstallDir $definition.Exe) (Get-StopDrainSeconds $Item)
+    Stop-ComponentService $definition.ServiceName $Item.InstallDir (Get-StopDrainSeconds $Item)
     & sc.exe delete $definition.ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "Could not delete service '$($definition.ServiceName)' (sc.exe exit code $LASTEXITCODE)." }
     Write-Note "Removed service '$($definition.ServiceName)'."
+
+    if ($Item.Key -eq 'SessionWorker') { Remove-SessionWorkerHttpSysBinding $Item }
 
     if ($Item.ScriptInstalled) {
         Remove-DirectoryTree $Item.InstallDir
@@ -611,6 +796,78 @@ function Sync-PackageFiles([string] $Staging, [string] $Target, [switch] $KeepAp
     [IO.File]::WriteAllLines($manifestPath, [string[]] $newFiles)
 }
 
+function Test-LauncherPackage($Item, [string] $Staging) {
+    return $Item.Key -ne 'Server' -and (Test-Path (Join-Path $Staging "launcher\$launcherExe"))
+}
+
+# A worker package with launcher\ goes to versions\<version>, and its launcher to the install folder
+# (install-manifest.txt then lists the launcher's files, so a flat install's package files are removed
+# and data and settings stay). updates\state.json names the version; the one it replaces is kept to fall back
+# to. A package without the launcher (an older release) is installed flat, undoing the layout.
+# Returns the service's command line and executable.
+function Install-PackageFiles($Item, [string] $Staging, [string] $Version, [switch] $KeepAppSettings) {
+    $installDir = $Item.InstallDir
+    $statePath = Join-Path $installDir $launcherStateName
+    $versionsDir = Join-Path $installDir 'versions'
+    if (-not (Test-LauncherPackage $Item $Staging)) {
+        if (Test-Path $statePath) {
+            Remove-DirectoryTree $versionsDir
+            Remove-DirectoryTree (Join-Path $installDir 'updates')
+        }
+        Sync-PackageFiles $Staging $installDir -KeepAppSettings:$KeepAppSettings
+        $exe = Join-Path $installDir $Item.Definition.Exe
+        return [pscustomobject]@{ CommandLine = "`"$exe`""; ServiceExe = $exe; WorkerExe = $null }
+    }
+
+    $versionDir = Join-Path $versionsDir $Version
+    $temporary = "$versionDir.staging"
+    New-Item -ItemType Directory -Force -Path $versionsDir | Out-Null
+    Remove-DirectoryTree $temporary
+    & robocopy.exe $Staging $temporary /E /R:3 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "Copying files to '$temporary' failed (robocopy exit code $LASTEXITCODE)." }
+    Remove-DirectoryTree $versionDir
+    Move-Item -LiteralPath $temporary -Destination $versionDir
+
+    Sync-PackageFiles (Join-Path $versionDir 'launcher') $installDir
+
+    # The version this one replaces is kept to fall back to; reinstalling the current version keeps its fallback.
+    $state = try { Read-JsonFile $statePath } catch { $null }
+    $previous = if (-not $state) { $null } elseif ("$($state.current)" -eq $Version) { "$($state.previous)" } else { "$($state.current)" }
+    if (-not $previous -or $previous -eq $Version -or -not (Test-Path (Join-Path $versionsDir "$previous\$($Item.Definition.Exe)"))) {
+        $previous = $null
+    }
+
+    # This run decides the version: a pending switch, a rolled-back version, and health markers no longer apply.
+    $updatesDir = Join-Path $installDir 'updates'
+    Remove-DirectoryTree $updatesDir
+    New-Item -ItemType Directory -Force -Path $updatesDir | Out-Null
+    Write-JsonFile $statePath ([ordered]@{ current = $Version; previous = $previous })
+    foreach ($entry in Get-ChildItem -LiteralPath $versionsDir -Force) {
+        if ($entry.Name -notin @($Version, $previous)) { Remove-DirectoryTree $entry.FullName }
+    }
+
+    $launcher = Join-Path $installDir $launcherExe
+    return [pscustomobject]@{
+        CommandLine = "`"$launcher`" --component $($Item.Key)"
+        ServiceExe = $launcher
+        WorkerExe = Join-Path $versionDir $Item.Definition.Exe
+    }
+}
+
+# The worker stages versions and writes its switch files, and the launcher replaces updates\state.json, as the
+# service account. LocalSystem already can; a service moved to its own account is granted Modify on versions\
+# and updates\ only, never on the install folder.
+function Grant-LauncherAccess([string] $ServiceName, [string] $InstallDir) {
+    $account = (Get-InstalledService $ServiceName).StartName
+    if (-not $account -or $account -in @('LocalSystem', '.\LocalSystem', 'NT AUTHORITY\SYSTEM')) { return }
+    foreach ($name in 'versions', 'updates') {
+        $path = Join-Path $InstallDir $name
+        New-Item -ItemType Directory -Force -Path $path | Out-Null
+        & icacls.exe $path /grant "$($account):(OI)(CI)M" | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warning "Could not grant $account Modify on '$path'; the worker cannot follow the server's version." }
+    }
+}
+
 # Kestrel:Endpoints overrides Urls. HTTP is preferred: it needs no trusted certificate for the local
 # health check or for a worker on the same machine.
 function Get-ListenUrl([string] $Directory) {
@@ -630,9 +887,16 @@ function Show-CrashLog([string] $Directory) {
         Write-Host "    crash.log:" -ForegroundColor Yellow
         Get-Content -Path $crashLog -Tail 20 | ForEach-Object { Write-Host "      $_" -ForegroundColor Yellow }
     }
+    $launcherLog = Join-Path $Directory 'logs\launcher.log'
+    if (Test-Path $launcherLog) {
+        Write-Host "    logs\launcher.log:" -ForegroundColor Yellow
+        Get-Content -Path $launcherLog -Tail 10 | ForEach-Object { Write-Host "      $_" -ForegroundColor Yellow }
+    }
 }
 
-function Wait-ComponentHealthy([string] $Key, $Definition, [string] $Directory) {
+# -WorkerExe: the worker a launcher runs. The launcher service stays running and restarts a worker that
+# exits, so the worker's own process is what is checked.
+function Wait-ComponentHealthy([string] $Key, $Definition, [string] $Directory, [string] $WorkerExe) {
     $name = $Definition.ServiceName
     if ($Key -eq 'Server') {
         $url = Get-ListenUrl $Directory
@@ -656,12 +920,21 @@ function Wait-ComponentHealthy([string] $Key, $Definition, [string] $Directory) 
     }
 
     # Workers exit within seconds on a configuration error (for example a missing StoragePath).
+    $startedAt = Get-Date
     Start-Sleep -Seconds 10
-    if ((Get-Service -Name $name).Status -eq 'Running') {
+    $serviceRunning = (Get-Service -Name $name).Status -eq 'Running'
+    $workerRunning = $true
+    if ($serviceRunning -and $WorkerExe) {
+        $crashLog = Join-Path $Directory 'crash.log'
+        $crashed = (Test-Path $crashLog) -and (Get-Item $crashLog).LastWriteTime -gt $startedAt
+        $workerRunning = -not $crashed -and [bool] (Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $WorkerExe })
+    }
+    if ($serviceRunning -and $workerRunning) {
         Write-Note "Service '$name' is running."
         return $true
     }
-    Write-Warning "Service '$name' is not running."
+    if (-not $serviceRunning) { Write-Warning "Service '$name' is not running." }
+    else { Write-Warning "Service '$name' runs, but its worker $WorkerExe keeps exiting." }
     Show-CrashLog $Directory
     return $false
 }
@@ -940,6 +1213,23 @@ function Get-SuggestedServerUrl {
     return $null
 }
 
+# The IPv4 address this machine reaches $Url from, which is the address the server sees when no proxy
+# or NAT is in between. Connecting a UDP socket only picks the route; nothing is sent.
+function Get-LocalAddressFor([string] $Url) {
+    $uri = $null
+    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref] $uri)) { return $null }
+    $socket = $null
+    try {
+        $address = [Net.Dns]::GetHostAddresses($uri.DnsSafeHost) | Where-Object AddressFamily -eq 'InterNetwork' | Select-Object -First 1
+        if (-not $address) { return $null }
+        $socket = [Net.Sockets.Socket]::new([Net.Sockets.AddressFamily]::InterNetwork, [Net.Sockets.SocketType]::Dgram, [Net.Sockets.ProtocolType]::Udp)
+        $socket.Connect($address, $uri.Port)
+        return $socket.LocalEndPoint.Address.ToString()
+    }
+    catch { return $null }
+    finally { if ($socket) { $socket.Dispose() } }
+}
+
 #endregion
 
 #region Preconditions
@@ -1022,7 +1312,7 @@ $plan = @(foreach ($key in $keys | Where-Object { $_ -in $Components }) {
         Key = $key; Definition = $definition; Service = $state.Service; Action = $itemAction
         InstallDir = $state.InstallDir; DataDir = $dataDir; InstalledVersion = $state.Version
         ScriptInstalled = [bool] ($state.Installed -and (Test-Path (Join-Path $state.InstallDir $manifestName)))
-        RemoveData = $false
+        RemoveData = $false; ServerId = $null
     }
 })
 if ($plan.Count -eq 0) { Write-Host 'Nothing to do.'; exit 0 }
@@ -1067,6 +1357,21 @@ if ($newInstalls.Count -gt 0) {
 
 $newWorkers = @($newInstalls | Where-Object { $_.Key -ne 'Server' })
 
+# A new Session Worker either connects to the server, or waits for the server to connect to it (for a
+# server in a network that accepts no inbound connections). Upgrades keep the installed mode.
+if ($newInstalls | Where-Object Key -eq 'SessionWorker') {
+    if (-not $SessionWorkerConnectionMode) {
+        Write-Host 'How does the Session Worker reach the server?'
+        $choice = Read-Choice 'Choose' @(
+            'Worker connects to server (host API key)',
+            'Server connects to worker (one-time pairing code; for a server that accepts no inbound connections)')
+        $SessionWorkerConnectionMode = if ($choice -like 'Server connects*') { 'ServerConnects' } else { 'WorkerConnects' }
+    }
+}
+$serverConnectsWorker = [bool] ($newInstalls | Where-Object Key -eq 'SessionWorker') -and $SessionWorkerConnectionMode -eq 'ServerConnects'
+# Workers that connect to the server need its URL; a worker the server connects to never contacts it.
+$connectingWorkers = @($newWorkers | Where-Object { -not ($_.Key -eq 'SessionWorker' -and $serverConnectsWorker) })
+
 if ($PublicUrl) { $PublicUrl = Assert-AbsoluteUrl $PublicUrl 'PublicUrl' }
 elseif ($newInstalls | Where-Object Key -eq 'Server') {
     $fqdn = try { [Net.Dns]::GetHostEntry([string]'').HostName.ToLowerInvariant() } catch { $env:COMPUTERNAME.ToLowerInvariant() }
@@ -1075,7 +1380,7 @@ elseif ($newInstalls | Where-Object Key -eq 'Server') {
 }
 
 if ($ServerUrl) { $ServerUrl = Assert-AbsoluteUrl $ServerUrl 'ServerUrl' }
-elseif ($newWorkers.Count -gt 0) {
+elseif ($connectingWorkers.Count -gt 0) {
     $ServerUrl = Assert-AbsoluteUrl (Read-Value 'Polygent server URL the workers connect to' (Get-SuggestedServerUrl) -Required) 'ServerUrl'
 }
 
@@ -1083,11 +1388,23 @@ if (-not $WorkerName -and $newWorkers.Count -gt 0) {
     $WorkerName = Read-Value 'Worker name shown on the Hosts page (unique per worker)' $env:COMPUTERNAME -Required
 }
 
+# A Deployment Worker installed before Agent:ServerId was required has none, and the server rejects its
+# registration. The server's upgrade set each existing deploy host's ServerId to the IP address it had
+# registered from, so that address keeps the host and its slots; any other value registers a new host.
+foreach ($item in $active | Where-Object { $_.Key -eq 'DeployWorker' -and $_.Action -eq 'Upgrade' }) {
+    $installed = Read-AppSettings $item.InstallDir
+    if ("$(Get-JsonValue $installed 'Agent:ServerId')".Trim()) { continue }
+    $url = if ($ServerUrl) { $ServerUrl } else { Get-JsonValue $installed 'Agent:MainServerUrl' }
+    Write-Warning 'The Deployment Worker has no Agent:ServerId, so the server rejects its registration.'
+    $item.ServerId = Read-Value 'Deployment Worker ServerId (enter the ServerId its host shows on the Hosts page to keep the host and its slots)' (Get-LocalAddressFor $url) -Required
+}
+
 # New workers need a key; upgrades keep the current one unless a replacement is passed as a parameter.
 foreach ($key in 'SessionWorker', 'DeployWorker') {
     $item = $active | Where-Object Key -eq $key
     $variable = "${key}ApiKey"
     if (-not $item -or $item.Action -eq 'Upgrade' -or (Get-Variable -Name $variable -ValueOnly)) { continue }
+    if ($key -eq 'SessionWorker' -and $serverConnectsWorker) { continue }
     $prompt = "$($item.Definition.Label) host API key (Hosts -> API Keys -> New API Key -> $(if ($key -eq 'DeployWorker') { 'Deploy Worker' } else { 'Session Worker' }))"
     Set-Variable -Name $variable -Value (Read-Secret $prompt)
 }
@@ -1113,7 +1430,10 @@ if ($active.Count -gt 0) {
     if (($active | Where-Object Key -ne 'Server') -and -not ($active | Where-Object Key -eq 'Server')) {
         $versionUrl = if ($ServerUrl) { $ServerUrl } else { Get-SuggestedServerUrl }
         $serverVersion = if ($versionUrl) { Get-ServerVersion $versionUrl } else { $null }
-        if (-not $serverVersion) {
+        if (-not $serverVersion -and -not $versionUrl) {
+            Write-Warning "No server URL to read the server version from (a worker the server connects to never contacts it). Workers must run the same release as the server; pass -Version with the server's release. Installing '$Version'."
+        }
+        elseif (-not $serverVersion) {
             Write-Warning "Could not read the server version from $versionUrl/api/version. Workers must run the same release as the server; installing '$Version'."
         }
         elseif (-not $PSBoundParameters.ContainsKey('Version')) {
@@ -1153,13 +1473,21 @@ foreach ($item in $plan) {
     }
     Write-Host ("  {0,-18} {1}" -f '', $item.InstallDir)
     if ($item.DataDir) { Write-Host ("  {0,-18} StoragePath: {1}" -f '', $item.DataDir) }
+    if ($item.ServerId) { Write-Host ("  {0,-18} Agent:ServerId: {1} (was not set)" -f '', $item.ServerId) }
+    if ($item.Action -eq 'Upgrade' -and $item.Key -eq 'Server' -and -not $SkipCompaction) {
+        Write-Host ("  {0,-18} SQLite database: backed up and compacted only for verified supporting releases (-SkipCompaction to skip)" -f '')
+    }
 }
 if ($active.Count -gt 0) {
     Write-Host "  Release:           $releaseVersion ($Repository)"
     Write-Host '  Service account:   LocalSystem, automatic start, restart on failure'
 }
 if ($PublicUrl) { Write-Host "  Public URL:        $PublicUrl" }
-if ($ServerUrl -and $newWorkers.Count -gt 0) { Write-Host "  Server URL:        $ServerUrl" }
+if ($ServerUrl -and $connectingWorkers.Count -gt 0) { Write-Host "  Server URL:        $ServerUrl" }
+if ($serverConnectsWorker) {
+    $listenAt = if ($SessionWorkerListenHostname) { "$($SessionWorkerListenHostname):$SessionWorkerListenPort (shared through HTTP.sys)" } else { "port $SessionWorkerListenPort" }
+    Write-Host "  Session Worker:    the server connects to it at $listenAt (inbound firewall rule added)"
+}
 if ($WorkerName -and $newWorkers.Count -gt 0) { Write-Host "  Worker name:       $WorkerName" }
 $toInstall = @($(if ($missingPrerequisites.DotNet) { '.NET 10 Hosting Bundle' }), $(if ($missingPrerequisites.Git) { 'Git for Windows' })) | Where-Object { $_ }
 if ($toInstall) { Write-Host "  Prerequisites:     will install $($toInstall -join ', ')" }
@@ -1173,6 +1501,7 @@ $tempRoot = Join-Path ([IO.Path]::GetTempPath()) "polygent-install-$([guid]::New
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 $results = @()
 $installedPrerequisites = @()
+$databaseBackup = $null
 
 try {
     if ($toInstall) {
@@ -1197,9 +1526,10 @@ try {
         Save-GitHubAsset $release $assetName $zipPath
         Expand-Archive -Path $zipPath -DestinationPath $staging -Force
         if (-not (Test-Path (Join-Path $staging $definition.Exe))) { throw "$assetName does not contain $($definition.Exe)." }
+        $useLauncher = Test-LauncherPackage $item $staging
 
-        $exePath = Join-Path $item.InstallDir $definition.Exe
-        $previous = if ($isUpgrade) { (Get-Item $exePath -ErrorAction SilentlyContinue).VersionInfo.ProductVersion } else { $null }
+        $previousExe = Join-Path $(if ($isUpgrade) { Get-PackageDir $item.InstallDir } else { $item.InstallDir }) $definition.Exe
+        $previous = if ($isUpgrade) { (Get-Item $previousExe -ErrorAction SilentlyContinue).VersionInfo.ProductVersion } else { $null }
 
         # Settings an older install kept in appsettings.json are found by comparing it with the
         # appsettings.json its release shipped, then moved to appsettings.Production.json. Done before
@@ -1213,6 +1543,10 @@ try {
             if ($baseline) {
                 $migrated = Get-JsonOverrides (Read-JsonFile $currentPath) $baseline
             }
+            elseif ($useLauncher) {
+                # The worker then runs from versions\<version>, which never sees an appsettings.json kept here.
+                throw "Could not find the appsettings.json that version '$previous' shipped, so the settings in $currentPath cannot be told from package defaults. Move your settings to $productionSettingsName, delete appsettings.json, and run this script again. Nothing was changed."
+            }
             else {
                 $keepAppSettings = $true
                 Write-Warning "Could not find the appsettings.json that version '$previous' shipped, so the installed appsettings.json is kept as is and does not receive the new version's defaults. To switch to the upgrade-safe layout, move your settings to $productionSettingsName, delete appsettings.json, and run this script again."
@@ -1221,7 +1555,7 @@ try {
 
         if ($isUpgrade) {
             if ($previous) { Write-Note "Installed version: $previous" }
-            Stop-ComponentService $definition.ServiceName $exePath (Get-StopDrainSeconds $item)
+            Stop-ComponentService $definition.ServiceName $item.InstallDir (Get-StopDrainSeconds $item)
             Assert-HarnessRollbackReady $item $previous $releaseVersion
         }
         else {
@@ -1234,7 +1568,7 @@ try {
             New-ProtectedDirectory $item.DataDir
         }
 
-        Sync-PackageFiles $staging $item.InstallDir -KeepAppSettings:$keepAppSettings
+        $installed = Install-PackageFiles $item $staging $releaseVersion -KeepAppSettings:$keepAppSettings
         if (-not $keepAppSettings) { Copy-Item -Path (Join-Path $staging 'appsettings.json') -Destination (Join-Path $item.InstallDir $baselineName) -Force }
 
         # Fresh installs get the required values; upgrades change only what was passed explicitly.
@@ -1259,8 +1593,19 @@ try {
             'SessionWorker' {
                 if (-not $isUpgrade) { Set-JsonValue $settings 'StoragePath' $item.DataDir }
                 if ($WorkerName) { Set-JsonValue $settings 'DisplayHostname' $WorkerName; $changed = $true }
-                if ($ServerUrl) { Set-JsonValue $settings 'ApiUrl' $ServerUrl; $changed = $true }
-                if ($SessionWorkerApiKey) { Set-JsonValue $settings 'ApiKey' (ConvertTo-PlainText $SessionWorkerApiKey); $changed = $true }
+                if ($SessionWorkerConnectionMode -and ($PSBoundParameters.ContainsKey('SessionWorkerConnectionMode') -or -not $isUpgrade)) {
+                    Set-JsonValue $settings 'ConnectionMode' $SessionWorkerConnectionMode
+                    $changed = $true
+                }
+                if ($SessionWorkerConnectionMode -eq 'ServerConnects') {
+                    if ($PSBoundParameters.ContainsKey('SessionWorkerListenPort') -or -not $isUpgrade) { Set-JsonValue $settings 'ListenPort' $SessionWorkerListenPort; $changed = $true }
+                    if ($SessionWorkerListenHostname) { Set-JsonValue $settings 'ListenHostname' $SessionWorkerListenHostname; $changed = $true }
+                    if ($SessionWorkerListenCertificate) { Set-JsonValue $settings 'ListenCertificate' $SessionWorkerListenCertificate; $changed = $true }
+                }
+                else {
+                    if ($ServerUrl) { Set-JsonValue $settings 'ApiUrl' $ServerUrl; $changed = $true }
+                    if ($SessionWorkerApiKey) { Set-JsonValue $settings 'ApiKey' (ConvertTo-PlainText $SessionWorkerApiKey); $changed = $true }
+                }
             }
             'DeployWorker' {
                 # ServerId is the host's identity; changing it on upgrade would register a new host.
@@ -1268,6 +1613,7 @@ try {
                     Set-JsonValue $settings 'Agent:StoragePath' $item.DataDir
                     Set-JsonValue $settings 'Agent:ServerId' $WorkerName
                 }
+                elseif ($item.ServerId) { Set-JsonValue $settings 'Agent:ServerId' $item.ServerId; $changed = $true }
                 if ($WorkerName) { Set-JsonValue $settings 'Agent:Name' $WorkerName; $changed = $true }
                 if ($ServerUrl) { Set-JsonValue $settings 'Agent:MainServerUrl' $ServerUrl; $changed = $true }
                 if ($DeployWorkerApiKey) { Set-JsonValue $settings 'Agent:ApiKey' (ConvertTo-PlainText $DeployWorkerApiKey); $changed = $true }
@@ -1276,17 +1622,62 @@ try {
         if ($changed) { Write-JsonFile $productionPath $settings }
 
         if (-not $isUpgrade) {
-            New-Service -Name $definition.ServiceName -BinaryPathName "`"$exePath`"" -DisplayName $definition.DisplayName `
+            New-Service -Name $definition.ServiceName -BinaryPathName $installed.CommandLine -DisplayName $definition.DisplayName `
                 -Description $definition.DisplayName -StartupType Automatic | Out-Null
             Write-Note "Registered service '$($definition.ServiceName)' (LocalSystem, automatic start)."
         }
+        elseif ($item.Key -ne 'Server') {
+            Set-ServiceCommandLine $definition.ServiceName $installed.CommandLine $installed.ServiceExe
+        }
+        if ($installed.WorkerExe) { Grant-LauncherAccess $definition.ServiceName $item.InstallDir }
         & sc.exe failure $definition.ServiceName reset= 86400 actions= restart/60000/restart/60000/restart/60000 | Out-Null
+
+        # The server connects to this worker, so Windows Firewall must let it in on the listen port.
+        # Through HTTP.sys (a host name) the connection belongs to Windows itself, not to the worker's
+        # program, and under the launcher the worker's path changes with each version it switches to,
+        # so those rules are for the port alone.
+        $listenSettings = if ($item.Key -eq 'SessionWorker') { Read-AppSettings $item.InstallDir } else { $null }
+        if ($listenSettings -and "$(Get-JsonValue $listenSettings 'ConnectionMode')" -eq 'ServerConnects') {
+            $listenPort = Get-JsonValue $listenSettings 'ListenPort'
+            if (-not $listenPort) { $listenPort = 443 }
+            if (Get-JsonValue $listenSettings 'ListenHostname') {
+                $ruleName = "Polygent Session Worker (port $listenPort, HTTP.sys)"
+                $ruleProgram = @{}
+            }
+            else {
+                $ruleName = "Polygent Session Worker (port $listenPort)"
+                $ruleProgram = if ($installed.WorkerExe) { @{} } else { @{ Program = $installed.ServiceExe } }
+            }
+            $rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+            if (-not $rule) {
+                New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP `
+                    -LocalPort $listenPort @ruleProgram | Out-Null
+                Write-Note "Added the inbound firewall rule '$ruleName'."
+            }
+            elseif ($installed.WorkerExe -and ($rule | Get-NetFirewallApplicationFilter).Program -ne 'Any') {
+                $rule | Get-NetFirewallApplicationFilter | Set-NetFirewallApplicationFilter -Program Any
+                Write-Note "The inbound firewall rule '$ruleName' now admits the port whichever worker version runs."
+            }
+        }
+
+        if ($isUpgrade -and $item.Key -eq 'Server' -and -not $SkipCompaction) {
+            $compaction = Invoke-DatabaseCompaction $item $releaseVersion
+            if ($compaction -and $compaction.BackupPath) { $databaseBackup = $compaction.BackupPath }
+            if ($compaction -and $compaction.ExitCode -eq 2) {
+                Write-Warning "The SQLite database could not be verified after compaction, so the '$($definition.ServiceName)' service was not started. Keep it stopped, replace the database file with the backup printed above, delete the database's -wal and -shm files, then start the service."
+                $results += [pscustomobject]@{ Item = $item; Healthy = $false; Action = $item.Action }
+                continue
+            }
+            if ($compaction -and $compaction.ExitCode -ne 0) {
+                Write-Warning 'Database compaction did not complete (see the reason above); the database is intact and the upgrade continues.'
+            }
+        }
 
         $healthy = $null
         if (-not $NoStart) {
             try {
                 Start-Service -Name $definition.ServiceName
-                $healthy = Wait-ComponentHealthy $item.Key $definition $item.InstallDir
+                $healthy = Wait-ComponentHealthy $item.Key $definition $item.InstallDir $installed.WorkerExe
             }
             catch {
                 Write-Warning "Service '$($definition.ServiceName)' failed to start: $($_.Exception.Message)"
@@ -1321,12 +1712,50 @@ foreach ($result in $results | Where-Object { $_.Action -eq 'Install' }) {
             Write-Note "        Publish $(Get-ListenUrl $item.InstallDir) through your HTTPS reverse proxy. The first user to sign in becomes Admin."
         }
         'SessionWorker' {
-            Write-Note 'Session Worker: approve the host on the Hosts page.'
+            if ($SessionWorkerConnectionMode -eq 'ServerConnects') {
+                # The worker shows a one-time code; the server uses it to pair and then connects to the worker.
+                # Under the launcher, the launcher runs the installed worker version with the arguments.
+                $exe = Join-Path $item.InstallDir $item.Definition.Exe
+                $pairArgs = @('--pair-code')
+                if (Test-Path (Join-Path $item.InstallDir $launcherStateName)) {
+                    $exe = Join-Path $item.InstallDir $launcherExe
+                    $pairArgs = @('--component', 'SessionWorker', '--pair-code')
+                }
+                $output = & $exe @pairArgs 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    Write-Note 'Session Worker: on the Hosts page choose Add Worker, enter this worker''s address and the pairing code:'
+                    $output | ForEach-Object { Write-Host "      $_" -ForegroundColor Green }
+                    Write-Note "        For a new code later, run: & '$exe' $($pairArgs -join ' ')"
+                }
+                else {
+                    Write-Warning "Could not issue a pairing code: $($output -join ' '). Run '$exe' $($pairArgs -join ' ') once the service runs."
+                }
+            }
+            else {
+                Write-Note 'Session Worker: approve the host on the Hosts page.'
+            }
         }
         'DeployWorker' {
             Write-Note 'Deployment Worker: approve the host on the Hosts page, then create deploy templates and slots.'
         }
     }
+}
+# The Server runs no sessions itself unless LocalHost:Enabled is true, which gives every session the Server's
+# account and keys. Say so after each install or upgrade.
+foreach ($result in $results | Where-Object { $_.Action -ne 'Uninstall' -and $_.Item.Key -eq 'Server' }) {
+    if ("$(Get-JsonValue (Read-AppSettings $result.Item.InstallDir) 'LocalHost:Enabled')" -eq 'true') {
+        Write-Warning "Server: LocalHost:Enabled is true, so sessions run under the Server's own account and can read its keys and database. Remove it from $(Join-Path $result.Item.InstallDir $productionSettingsName) on a server several people use."
+    }
+    else {
+        Write-Note 'Server: sessions run only on Session Workers; until one is connected, starting a session fails. Install a Session Worker on another machine,'
+        Write-Note "        or on this one under its own low-privilege service account (not LocalSystem), so it cannot read the Server's data folder."
+    }
+}
+if ($results | Where-Object { $_.Action -eq 'Upgrade' -and $_.Item.Key -eq 'Server' }) {
+    Write-Note 'Workers: those installed with the worker launcher switch to the new version by themselves within minutes. Run this script once on any worker host the Hosts page still flags.'
+}
+if ($databaseBackup) {
+    Write-Note "Server: compaction kept a verified database backup at $databaseBackup. Delete it, and older backups in its folder, once the upgraded Server runs normally."
 }
 foreach ($result in $results | Where-Object { $_.Action -eq 'Uninstall' -and $_.Item.Key -ne 'Server' }) {
     Write-Note "$($result.Item.Definition.Label): delete this machine's host on the Hosts page, and revoke its host API key."
