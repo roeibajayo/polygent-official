@@ -693,6 +693,25 @@ function Remove-DirectoryTree([string] $Path) {
     }
 }
 
+# A folder cannot be renamed while a file in it is open, and on-access antivirus opens the executables
+# robocopy has just written to scan them. So the rename is retried while that scan finishes. Not Move-Item:
+# when the rename fails it has already created the destination folder, which then fails every retry.
+function Move-DirectoryWithRetry([string] $Source, [string] $Destination, [int] $TimeoutSeconds = 60) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ($true) {
+        try {
+            [IO.Directory]::Move($Source, $Destination)
+            return
+        }
+        catch {
+            if ((Get-Date) -ge $deadline) {
+                throw "Could not rename '$Source' to '$Destination' within $TimeoutSeconds s; another program (often antivirus) still has a file in it open: $($_.Exception.GetBaseException().Message)"
+            }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
 function Remove-EmptyDirectory([string] $Path) {
     if ((Test-SafeToDelete $Path) -and (Test-Path $Path) -and -not (Get-ChildItem -Path $Path -Force)) {
         Remove-Item -Path $Path -Force
@@ -826,7 +845,7 @@ function Install-PackageFiles($Item, [string] $Staging, [string] $Version, [swit
     & robocopy.exe $Staging $temporary /E /R:3 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "Copying files to '$temporary' failed (robocopy exit code $LASTEXITCODE)." }
     Remove-DirectoryTree $versionDir
-    Move-Item -LiteralPath $temporary -Destination $versionDir
+    Move-DirectoryWithRetry $temporary $versionDir
 
     Sync-PackageFiles (Join-Path $versionDir 'launcher') $installDir
 
