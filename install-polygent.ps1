@@ -26,16 +26,16 @@
     Any parameter left out is prompted for interactively, with a suggested default.
 
 .NOTES
-    Maintainers: docs/install/SCRIPT.md in the Polygent repository describes publishing, the
+    Maintainers: paid/docs/install/SCRIPT.md in the Polygent repository describes publishing, the
     product contracts this script depends on, and the design decisions behind it.
 
 .EXAMPLE
-    irm https://raw.githubusercontent.com/roeibajayo/polygent-official/main/install-polygent.ps1 | iex
+    irm https://github.com/roeibajayo/polygent-official/releases/latest/download/install-polygent.ps1 | iex
 
     Runs the published script without saving it first.
 
 .EXAMPLE
-    & ([scriptblock]::Create((irm https://raw.githubusercontent.com/roeibajayo/polygent-official/main/install-polygent.ps1))) -Components DeployWorker
+    & ([scriptblock]::Create((irm https://github.com/roeibajayo/polygent-official/releases/latest/download/install-polygent.ps1))) -Components DeployWorker
 
     Runs the published script with parameters.
 
@@ -156,7 +156,7 @@ if (-not $PSCommandPath) {
     $installerText = "$($MyInvocation.MyCommand.ScriptBlock)"
     if ($installerText -notmatch 'polygent-installer-bootstrap') {
         $installerText = Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'polygent-installer' } `
-            -Uri 'https://raw.githubusercontent.com/roeibajayo/polygent-official/main/install-polygent.ps1'
+            -Uri 'https://github.com/roeibajayo/polygent-official/releases/latest/download/install-polygent.ps1'
     }
     $installerCopy = Join-Path ([IO.Path]::GetTempPath()) 'install-polygent.ps1'
     [IO.File]::WriteAllText($installerCopy, $installerText, (New-Object Text.UTF8Encoding $true))
